@@ -1,0 +1,428 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Space Defender — Single File Game</title>
+<style>
+  :root{ --bg:#071226; --panel:#0b2136; --accent:#4fd1c5; --muted:#9fb3c8; }
+  html,body{height:100%;margin:0;background:linear-gradient(180deg,#031021,#071226);color:#dff6f0;font-family:Inter, system-ui, Arial;}
+  .wrap{max-width:980px;margin:20px auto;padding:12px;display:flex;flex-direction:column;gap:12px;}
+  header{display:flex;align-items:center;justify-content:space-between;gap:12px}
+  h1{margin:0;font-size:18px;color:var(--accent)}
+  .ui{display:flex;gap:8px;align-items:center}
+  .btn{background:#083046;border:1px solid rgba(255,255,255,0.03);padding:8px 10px;border-radius:8px;color:var(--muted);cursor:pointer}
+  canvas{display:block;border-radius:10px;width:100%;height:72vh; background: radial-gradient(ellipse at center,#071b2b 0,#031021 60%);box-shadow:0 10px 30px rgba(0,0,0,0.6)}
+  .controls{display:flex;gap:12px;align-items:center;color:var(--muted);font-size:13px}
+  .footer{display:flex;justify-content:space-between;align-items:center;color:var(--muted);font-size:13px}
+  .touch-controls{display:none;gap:8px}
+  .touch-controls button{padding:10px;border-radius:8px;background:rgba(255,255,255,0.03);color:var(--muted);border:0}
+  @media (max-width:700px){
+    canvas{height:60vh}
+    .touch-controls{display:flex}
+  }
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <div>
+        <h1>Space Defender</h1>
+        <div class="controls">Move: ← → or A/D • Shoot: Space • Pause: P</div>
+      </div>
+      <div class="ui">
+        <button id="pauseBtn" class="btn">Pause</button>
+        <button id="restartBtn" class="btn">Restart</button>
+      </div>
+    </header>
+
+    <canvas id="game"></canvas>
+
+    <div class="footer">
+      <div id="status">Score: 0 · Lives: 3 · Level: 1</div>
+      <div class="touch-controls" id="touchControls">
+        <button id="leftTouch">◀</button>
+        <button id="shootTouch">●</button>
+        <button id="rightTouch">▶</button>
+      </div>
+    </div>
+  </div>
+
+<script>
+/* ======== Space Defender ========
+   Single-file HTML5 Canvas top-down shooter
+   Controls: left/right arrows or A/D to move, Space to shoot, P to pause
+   Touch: on small screens, use on-screen buttons
+*/
+
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+let W, H;
+function resize() {
+  const ratio = devicePixelRatio || 1;
+  W = canvas.clientWidth;
+  H = canvas.clientHeight;
+  canvas.width = Math.floor(W * ratio);
+  canvas.height = Math.floor(H * ratio);
+  ctx.setTransform(ratio,0,0,ratio,0,0);
+}
+window.addEventListener('resize', resize);
+resize();
+
+/* Game state */
+let running = true;
+let paused = false;
+let score = 0;
+let lives = 3;
+let level = 1;
+
+/* Player */
+const player = {
+  x: 0, y: 0, w: 36, h: 22, speed: 360, color: '#7be3d0',
+  cooldown: 0
+};
+
+/* Entities */
+const bullets = [];
+const enemies = [];
+const powerups = [];
+
+/* Timing */
+let lastTime = 0;
+let spawnTimer = 0;
+let spawnInterval = 1500; // ms
+let enemySpeedBase = 80;
+
+/* Input */
+const keys = {};
+window.addEventListener('keydown', e => { keys[e.key.toLowerCase()] = true; if(e.key === ' ' ) e.preventDefault(); });
+window.addEventListener('keyup', e => { keys[e.key.toLowerCase()] = false; });
+
+document.getElementById('pauseBtn').addEventListener('click', ()=> togglePause());
+document.getElementById('restartBtn').addEventListener('click', ()=> resetGame());
+
+/* Touch controls */
+const leftTouch = document.getElementById('leftTouch');
+const rightTouch = document.getElementById('rightTouch');
+const shootTouch = document.getElementById('shootTouch');
+if(leftTouch){ leftTouch.addEventListener('touchstart', e=>{ keys['arrowleft']=true; e.preventDefault(); }); leftTouch.addEventListener('touchend', e=>{ keys['arrowleft']=false; }); }
+if(rightTouch){ rightTouch.addEventListener('touchstart', e=>{ keys['arrowright']=true; e.preventDefault(); }); rightTouch.addEventListener('touchend', e=>{ keys['arrowright']=false; }); }
+if(shootTouch){ shootTouch.addEventListener('touchstart', e=>{ keys[' ']=true; shoot(); setTimeout(()=>keys[' ']=false, 150); e.preventDefault(); }); }
+
+/* Audio - tiny synth-like fx using WebAudio */
+const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+function beep(freq=440, duration=0.08, type='sine', vol=0.08) {
+  try {
+    const o = audioCtx.createOscillator();
+    const g = audioCtx.createGain();
+    o.type = type; o.frequency.value = freq;
+    g.gain.value = vol;
+    o.connect(g); g.connect(audioCtx.destination);
+    o.start();
+    g.gain.exponentialRampToValueAtTime(0.0001, audioCtx.currentTime + duration);
+    setTimeout(()=>{ o.stop(); }, duration*1000 + 50);
+  } catch(e){}
+}
+
+/* helpers */
+function rand(min,max){ return Math.random()*(max-min)+min; }
+function clamp(v,a,b){ return Math.max(a, Math.min(b, v)); }
+
+/* spawn enemy */
+function spawnEnemy() {
+  const size = rand(18,48);
+  enemies.push({
+    x: rand(size/2, W - size/2),
+    y: -size,
+    r: size/2,
+    vx: rand(-20, 20),
+    vy: enemySpeedBase + Math.random()*60 + level*8,
+    hp: Math.ceil(size/16),
+    rot: rand(0,Math.PI*2),
+    rotSpeed: rand(-0.02,0.02),
+    color: `hsl(${rand(0,360)},60%,60%)`
+  });
+}
+
+/* spawn powerup occasionally */
+function spawnPowerup(x,y) {
+  powerups.push({x,y,ty: Math.random() < 0.5 ? 'life' : 'rapid', r:10, vy:60});
+}
+
+/* shooting */
+function shoot() {
+  if(player.cooldown > 0) return;
+  bullets.push({x:player.x, y:player.y - player.h/2 - 6, vy:-500, r:4});
+  player.cooldown = (powerupsActive.rapid ? 140 : 300);
+  beep(900,0.06,'square',0.04);
+}
+
+/* collisions */
+function circleHit(a,b){ return (a.x-b.x)**2 + (a.y-b.y)**2 <= (a.r+b.r)**2; }
+
+function update(dt) {
+  if(paused) return;
+  // player pos
+  if(keys['arrowleft'] || keys['a']) player.x -= player.speed * dt;
+  if(keys['arrowright']|| keys['d']) player.x += player.speed * dt;
+  player.x = clamp(player.x, player.w/2, W - player.w/2);
+  // cooldown
+  if(player.cooldown > 0) player.cooldown = Math.max(0, player.cooldown - dt*1000);
+
+  // auto shooting if holding space or touch
+  if(keys[' '] || keys['space']) shoot();
+
+  // update bullets
+  for(let i=bullets.length-1;i>=0;i--){
+    const b = bullets[i];
+    b.y += b.vy * dt;
+    if(b.y < -10) bullets.splice(i,1);
+  }
+
+  // update enemies
+  for(let i=enemies.length-1;i>=0;i--){
+    const e = enemies[i];
+    e.x += e.vx * dt;
+    e.y += e.vy * dt;
+    e.rot += e.rotSpeed;
+    // bounce horizontally
+    if(e.x < e.r && e.vx < 0) e.vx *= -1;
+    if(e.x > W - e.r && e.vx > 0) e.vx *= -1;
+    // collision with bullets
+    for(let j=bullets.length-1;j>=0;j--){
+      if(circleHit({x:e.x,y:e.y,r:e.r},{x:bullets[j].x,y:bullets[j].y,r:bullets[j].r})){
+        e.hp -= 1;
+        bullets.splice(j,1);
+        beep(1200, 0.03, 'sine', 0.03);
+        if(e.hp <= 0){
+          // explode
+          score += Math.round(10 + e.r);
+          // small chance to drop powerup
+          if(Math.random() < 0.12) spawnPowerup(e.x, e.y);
+          enemies.splice(i,1);
+          beep(200 + Math.random()*800, 0.08, 'sawtooth', 0.06);
+          break;
+        }
+      }
+    }
+    // if enemy reached bottom -> damage
+    if(e.y - e.r > H){
+      enemies.splice(i,1);
+      lives -= 1;
+      beep(160,0.12,'sine',0.08);
+      if(lives <= 0) gameOver();
+    }
+  }
+
+  // update powerups
+  for(let i=powerups.length-1;i>=0;i--){
+    const p = powerups[i];
+    p.y += p.vy * dt;
+    if(circleHit({x:p.x,y:p.y,r:p.r},{x:player.x,y:player.y,r:player.w/2})){
+      if(p.ty === 'life') { lives = Math.min(5, lives + 1); beep(900,0.08,'triangle',0.06); }
+      if(p.ty === 'rapid') { activateRapid(); beep(1100,0.08,'square',0.06); }
+      powerups.splice(i,1);
+    } else if(p.y > H + 30) powerups.splice(i,1);
+  }
+
+  // spawn logic
+  spawnTimer += dt*1000;
+  if(spawnTimer > spawnInterval) {
+    spawnTimer = 0;
+    spawnEnemy();
+    // gradually increase difficulty
+    if(Math.random() < 0.2) spawnEnemy();
+  }
+
+  // level increase
+  const oldLevel = level;
+  level = 1 + Math.floor(score / 300);
+  if(level !== oldLevel){
+    enemySpeedBase += 6;
+    spawnInterval = Math.max(500, spawnInterval - 80);
+  }
+
+  // occasional powerup spawn
+  if(Math.random() < dt*0.02) {
+    spawnPowerup(rand(40, W-40), -20);
+  }
+
+  // keep entities under reasonable counts
+  if(enemies.length > 40) enemies.splice(0, enemies.length - 40);
+}
+
+/* Rapid fire powerup state */
+let powerupsActive = { rapid: false };
+let rapidTimeout = 0;
+function activateRapid() {
+  powerupsActive.rapid = true;
+  rapidTimeout = 5000; // ms
+  setTimeout(()=>{ powerupsActive.rapid = false; }, rapidTimeout);
+}
+
+/* draw */
+function draw() {
+  // clear
+  ctx.clearRect(0,0,W,H);
+
+  // background stars
+  for(let i=0;i<40;i++){
+    ctx.fillStyle = 'rgba(255,255,255,0.02)';
+    const sx = (i*97) % W;
+    const sy = ((i*63)+ (Date.now()*0.02)) % H;
+    ctx.fillRect((sx+7)%W, (sy+3)%H, 1.5, 1.5);
+  }
+
+  // player
+  ctx.save();
+  ctx.translate(player.x, player.y);
+  // ship body
+  ctx.fillStyle = player.color;
+  ctx.beginPath();
+  ctx.moveTo(0, -player.h/2);
+  ctx.lineTo(player.w/2, player.h/2);
+  ctx.lineTo(-player.w/2, player.h/2);
+  ctx.closePath();
+  ctx.fill();
+  // cockpit
+  ctx.fillStyle = '#03364a';
+  ctx.beginPath();
+  ctx.ellipse(0, -2, player.w*0.22, player.h*0.22, 0, 0, Math.PI*2);
+  ctx.fill();
+  ctx.restore();
+
+  // bullets
+  for(const b of bullets){
+    ctx.fillStyle = '#aef0e0';
+    ctx.beginPath();
+    ctx.ellipse(b.x, b.y, b.r, b.r*1.6, 0, 0, Math.PI*2);
+    ctx.fill();
+  }
+
+  // enemies (asteroids)
+  for(const e of enemies){
+    ctx.save();
+    ctx.translate(e.x, e.y);
+    ctx.rotate(e.rot);
+    ctx.fillStyle = e.color;
+    ctx.beginPath();
+    // rough polygon for asteroid
+    const spikes = 8;
+    for(let s=0;s<spikes;s++){
+      const a = (s/spikes)*Math.PI*2;
+      const rr = e.r * (0.7 + 0.4*Math.sin(s*1.9 + e.rot*3));
+      const px = Math.cos(a)*rr, py = Math.sin(a)*rr;
+      if(s===0) ctx.moveTo(px,py); else ctx.lineTo(px,py);
+    }
+    ctx.closePath();
+    ctx.fill();
+    // HP marker
+    ctx.fillStyle = 'rgba(0,0,0,0.2)';
+    ctx.fillRect(-e.r, e.r+4, e.r*2*(e.hp/Math.ceil(e.r/16)), 4);
+    ctx.restore();
+  }
+
+  // powerups
+  for(const p of powerups){
+    ctx.save();
+    ctx.translate(p.x, p.y);
+    if(p.ty === 'life'){
+      ctx.fillStyle = '#ffeb99';
+      ctx.beginPath(); ctx.arc(0,0,p.r,0,Math.PI*2); ctx.fill();
+      ctx.fillStyle = '#944'; ctx.fillRect(-6,-2,12,4); ctx.fillRect(-2,-6,4,12);
+    } else {
+      ctx.fillStyle = '#b8f0ff';
+      ctx.beginPath(); ctx.arc(0,0,p.r,0,Math.PI*2); ctx.fill();
+      ctx.fillStyle = '#044'; ctx.fillRect(-6,-2,12,4);
+    }
+    ctx.restore();
+  }
+
+  // HUD
+  ctx.fillStyle = 'rgba(0,0,0,0.35)';
+  ctx.fillRect(10,10,170,40);
+  ctx.fillStyle = '#dff6f0';
+  ctx.font = '14px system-ui, Arial';
+  ctx.fillText(`Score: ${score}`, 18, 28);
+  ctx.fillText(`Lives: ${lives}  Level: ${level}`, 18, 44);
+
+  // paused overlay
+  if(paused){
+    ctx.fillStyle = 'rgba(0,0,0,0.45)';
+    ctx.fillRect(0,0,W,H);
+    ctx.fillStyle = '#fff';
+    ctx.font = '28px system-ui, Arial';
+    ctx.textAlign = 'center';
+    ctx.fillText('PAUSED', W/2, H/2 - 10);
+    ctx.font = '14px system-ui, Arial';
+    ctx.fillText('Press P to resume', W/2, H/2 + 20);
+    ctx.textAlign = 'start';
+  }
+}
+
+/* game over */
+let gameOverFlag = false;
+function gameOver() {
+  gameOverFlag = true;
+  paused = true;
+  beep(80,0.4,'sine',0.08);
+  setTimeout(()=> {
+    const msg = `Game Over\nScore: ${score}\nClick Restart to play again.`;
+    alert(msg);
+  }, 200);
+}
+
+/* reset */
+function resetGame() {
+  score = 0; lives = 3; level = 1;
+  enemies.length = 0; bullets.length = 0; powerups.length = 0;
+  spawnInterval = 1500; enemySpeedBase = 80; spawnTimer = 0;
+  player.x = W/2; player.y = H - 60;
+  player.cooldown = 0; gameOverFlag = false; paused = false;
+}
+
+/* main loop */
+function loop(ts) {
+  if(!lastTime) lastTime = ts;
+  const dt = Math.min(0.05, (ts - lastTime)/1000);
+  lastTime = ts;
+  if(running && !paused){
+    update(dt);
+  }
+  draw();
+  document.getElementById('status').textContent = `Score: ${score} · Lives: ${lives} · Level: ${level}`;
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+/* init start positions */
+player.x = W/2; player.y = H - 60;
+
+/* keyboard control extras */
+window.addEventListener('keypress', e=>{
+  if(e.key.toLowerCase() === 'p') togglePause();
+  if(e.key === ' ' || e.key === 'Spacebar') { e.preventDefault(); shoot(); }
+});
+
+/* pause toggle */
+function togglePause(){ paused = !paused; document.getElementById('pauseBtn').textContent = paused ? 'Resume' : 'Pause'; }
+
+/* start with 2 enemies */
+spawnEnemy(); spawnEnemy();
+
+/* small routine to create random enemy every now and then & award points for dodging */
+setInterval(()=>{ if(!paused) score += Math.floor(Math.random()*0.6); }, 2000);
+
+/* simple canvas click to shoot */
+canvas.addEventListener('click', ()=> { shoot(); });
+
+/* make sure audio context resumes on first user gesture */
+function resumeAudio() {
+  if(audioCtx.state === 'suspended') audioCtx.resume();
+  window.removeEventListener('pointerdown', resumeAudio);
+}
+window.addEventListener('pointerdown', resumeAudio);
+
+</script>
+</body>
+</html>
